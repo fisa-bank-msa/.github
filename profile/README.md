@@ -202,8 +202,246 @@ fisa-msa/
 
 ## 주요 특징
 
-- **ISO8583 프로토콜**: POS ↔ VAN 간 금융 표준 메시지 포맷 사용 (j8583 라이브러리)
-- **카드 타입 분기**: 체크카드는 은행 잔액 실시간 확인 후 출금, 신용카드는 한도 차감
-- **정산 무결성 검증**: 모든 은행의 차액(net amount) 합계가 반드시 0이 되도록 검증
-- **Basic Auth**: VAN → 카드사 구간 HTTP 기본 인증 적용
-- **타임아웃 및 재시도**: 카드사의 은행 호출 시 잔액 조회 10초, 출금 30초 타임아웃 / 최대 1회 재시도
+### 1. ISO8583 메시지 구성
+
+#### ISO8583이란?
+
+ISO8583은 금융 거래 메시지를 위한 국제 표준 프로토콜입니다.
+카드 결제 시 POS 단말기와 VAN사 사이에서 실제로 사용되는 전문(電文) 포맷으로,
+메시지 타입(MTI) + 비트맵 + 데이터 필드(DE) 구조로 구성됩니다.
+
+```
+[ MTI (4byte) ][ Bitmap (8~16byte) ][ DE2 ][ DE4 ][ DE37 ][ DE41 ][ DE42 ] ...
+```
+#### ISO8583 전문 구성
+
+| DE | 필드명 | 설명 | 예시 |
+|----|--------|------|------|
+| 2 | Card Number | 카드번호 (LLVAR) | 4111111111111111 |
+| 4 | Amount | 결제 금액 | 000000010000 |
+| 37 | Transaction ID | 거래 ID (ALPHA 12) | 048231 |
+| 41 | Terminal ID | 단말기 ID (ALPHA 8) | TERM0001 |
+| 42 | Merchant ID | 가맹점 ID (ALPHA 15) | MERCHANT000001 |
+
+---
+
+### 2. POS Server - 메시지 생성
+
+결제 요청 시 j8583 라이브러리를 사용해 ISO8583 메시지를 생성합니다.
+
+```java
+// Iso8583MessageBuilder.java
+MessageFactory<IsoMessage> factory = new MessageFactory<>();
+factory.setUseBinaryMessages(false);  // ASCII 모드
+
+IsoMessage isoMessage = factory.newMessage(0x0200);  // MTI 0200: 승인 요청
+
+isoMessage.setValue(2,  cardNumber,     IsoType.LLVAR,  0);   // DE2:  카드번호
+isoMessage.setValue(4,  amount,         IsoType.AMOUNT, 0);   // DE4:  거래금액
+isoMessage.setValue(37, transactionId,  IsoType.ALPHA,  12);  // DE37: 거래 고유번호
+isoMessage.setValue(41, terminalId,     IsoType.ALPHA,  8);   // DE41: 단말기 ID
+isoMessage.setValue(42, merchantId,     IsoType.ALPHA,  15);  // DE42: 가맹점 ID
+
+byte[] messageBytes = isoMessage.writeData();
+```
+
+생성된 바이트 배열은 **Base64로 인코딩**하여 VAN 서버로 HTTP 전송합니다.
+
+```java
+// VanClient.java
+String encodedMessage = Base64.getEncoder().encodeToString(iso8583Message);
+VanRequest request = VanRequest.builder()
+        .rawIsoMessage(encodedMessage)
+        .build();
+```
+
+---
+
+### 3. VAN Server - 메시지 파싱
+
+VAN 서버는 수신한 메시지를 j8583 설정 파일(`j8583.xml`) 기반으로 파싱합니다.
+
+```xml
+<!-- j8583.xml -->
+<j8583-config>
+    <parse type="0200">
+        <field num="2"  type="LLVAR" />           <!-- 카드번호 -->
+        <field num="4"  type="AMOUNT" />           <!-- 거래금액 -->
+        <field num="37" type="NUMERIC" length="6" />  <!-- 거래 고유번호 -->
+        <field num="41" type="ALPHA"   length="8" />  <!-- 단말기 ID -->
+        <field num="42" type="ALPHA"   length="15" /> <!-- 가맹점 ID -->
+    </parse>
+</j8583-config>
+```
+
+```java
+// PaymentController.java
+messageFactory = ConfigParser.createFromClasspathConfig("j8583.xml");
+
+IsoMessage parsedMsg = messageFactory.parseMessage(messageBytes, 0);
+
+String cardNumber     = parsedMsg.getObjectValue(2).toString();   // DE2
+BigDecimal amount     = new BigDecimal(parsedMsg.getObjectValue(4).toString());  // DE4
+String transactionId  = parsedMsg.getObjectValue(37).toString();  // DE37
+String terminalId     = parsedMsg.getObjectValue(41).toString();  // DE41
+String merchantId     = parsedMsg.getObjectValue(42).toString();  // DE42
+```
+
+파싱된 데이터는 `AuthorizationRequest`로 변환되어 카드사(card-authorization-service)로 전달됩니다.
+
+
+---
+### 4. Eureka Server - 서비스 디스커버리
+
+각 서비스가 IP/포트를 직접 명시하지 않고, 서비스 이름으로 서로를 찾을 수 있도록 Eureka Server를 사용했습니다.
+
+```yaml
+# eureka-server/application.yaml
+server:
+  port: 8761
+
+eureka:
+  client:
+    register-with-eureka: false   # 자기 자신은 등록 안 함
+    fetch-registry: false
+  server:
+    eviction-interval-timer-in-ms: 5000  # 5초마다 비정상 서비스 제거
+```
+
+각 서비스는 Eureka에 자신을 등록하고, 호출 시 서비스 이름으로 조회합니다.
+
+```yaml
+# 각 서비스 공통 설정
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+```
+
+**실행 순서 상 Eureka Server가 가장 먼저 실행**되어야 다른 서비스들이 정상 등록됩니다.
+
+---
+
+### 5. API Gateway - 단일 진입점
+
+외부에서 들어오는 요청을 서비스 이름 기반으로 라우팅합니다.
+`lb://` 접두사를 통해 Eureka에 등록된 서비스를 로드밸런싱으로 호출합니다.
+
+```yaml
+# api-gateway/application.yaml
+server:
+  port: 8000
+
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: bank-service
+          uri: lb://bank-service          # Eureka에서 서비스 이름으로 조회
+          predicates:
+            - Path=/api/account/**, /api/transactions/**, /api/transfer/**
+
+        - id: bank-account-service
+          uri: lb://bank-account-service
+          predicates:
+            - Path=/api/bok/**
+```
+
+**라우팅 규칙 요약**
+
+```
+외부 요청 (port: 8000)
+    │
+    ├─ /api/account/**      → bank-service
+    ├─ /api/transactions/** → bank-service
+    ├─ /api/transfer/**     → bank-service
+    └─ /api/bok/**          → fisa-bank-account-service
+```
+
+---
+
+### 6. Netting 기반 정산 계산
+
+#### Netting이란?
+
+건별로 은행 간 자금을 이체하는 대신, **하루치 거래를 모아 차액(Net)만 정산**하는 방식입니다.
+예를 들어 A은행 → B은행 이체 100건, B은행 → A은행 이체 80건이 있다면
+실제 이동하는 금액은 차액 1건뿐입니다.
+
+---
+
+### Settlement Service 구현
+
+```java
+// SettlementService.java
+
+// 1. 해당 날짜 거래 내역 전체 수집
+List<TransactionDto> transactions = bankClientService.getTransactionsByDate(date);
+
+// 2. 은행 코드별로 그룹화
+Map<String, List<TransactionDto>> groupedByBank =
+    transactions.stream()
+                .collect(Collectors.groupingBy(TransactionDto::bankCode));
+
+List<AdjustRequest> adjustRequests = new ArrayList<>();
+BigDecimal checkSum = BigDecimal.ZERO;
+
+for (Map.Entry<String, List<TransactionDto>> entry : groupedByBank.entrySet()) {
+    String bankCode = entry.getKey();
+    BigDecimal totalDebit  = BigDecimal.ZERO;  // 줄 돈 (출금)
+    BigDecimal totalCredit = BigDecimal.ZERO;  // 받을 돈 (입금)
+
+    for (TransactionDto tx : entry.getValue()) {
+        if ("WITHDRAWAL".equals(tx.transactionType())) {
+            totalDebit = totalDebit.add(tx.amount());
+        } else if ("DEPOSIT".equals(tx.transactionType())) {
+            totalCredit = totalCredit.add(tx.amount());
+        }
+    }
+
+    // 3. 차액(Net) 계산
+    BigDecimal netAmount = totalCredit.subtract(totalDebit);
+    checkSum = checkSum.add(netAmount);
+
+    adjustRequests.add(new AdjustRequest(bankCode, netAmount));
+}
+
+// 4. 무결성 검증 - 모든 차액의 합은 반드시 0
+if (checkSum.compareTo(BigDecimal.ZERO) != 0) {
+    return new SettlementResponse(date, totalCount, totalAmount, "FAILED_CHECKSUM_ERROR");
+}
+
+// 5. 한국은행 당좌예금 계좌 업데이트 요청
+bankAccountClientService.sendAdjustments(adjustRequests);
+```
+
+---
+
+### Bank Account Service - 실제 계좌 처리
+
+settlement-service로부터 은행별 차액을 받아 한은 당좌예금 계좌를 업데이트합니다.
+
+```java
+// BankAccountService.java
+for (DeductRequest request : requests) {
+    Account account = accountRepository.findByBankCode(request.getBankCode());
+
+    if (request.getNetAmount().compareTo(BigDecimal.ZERO) > 0) {
+        account.deposit(request.getNetAmount());   // 양수 → 입금
+    } else {
+        account.deduct(request.getNetAmount().abs()); // 음수 → 출금
+    }
+}
+```
+
+---
+
+### 정산 흐름 예시
+
+| 은행 | 출금 합계 | 입금 합계 | 차액 (Net) | 한은 당좌 처리 |
+|------|---------|---------|-----------|-------------|
+| A은행 | 500만원 | 300만원 | **-200만원** | 200만원 차감 |
+| B은행 | 200만원 | 400만원 | **+200만원** | 200만원 입금 |
+| **합계** | | | **0** | 무결성 통과 |
+
+> 차액의 합이 0이 아니면 `FAILED_CHECKSUM_ERROR`를 반환하고 정산을 중단합니다.
